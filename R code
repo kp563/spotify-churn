@@ -1,0 +1,294 @@
+install.packages("jsonlite")   # run once if not installed
+library(jsonlite)
+
+
+#LOAD DATASET
+
+
+df <- stream_in(file("mini_sparkify_event_data.json"))
+
+# quick look
+head(df)
+
+
+getwd()
+list.files()
+
+setwd("/Users/maitrigosrani/Downloads")
+
+
+dim(df)
+
+
+names(df)
+length(unique(df$userId))
+table(df$page)
+
+# identify churned users
+churn_users <- unique(df$userId[df$page == "Cancellation Confirmation"])
+
+# create churn label
+df$churn <- ifelse(df$userId %in% churn_users, 1, 0)
+
+
+user_churn <- unique(df[, c("userId", "churn")])
+table(user_churn$churn)
+
+
+df <- df[df$userId != "", ]
+
+length(unique(df$userId))
+
+
+#initial findings
+#Approximately 23% of users in the dataset churned, indicating class imbalance and motivating the use of appropriate evaluation metrics.
+
+
+
+# INITIAL EDA
+
+#Step 4a: Compute churn rate by subscription level
+
+library(dplyr)
+library(ggplot2)
+
+churn_by_level <- df %>%
+  select(userId, level, churn) %>%
+  distinct() %>%
+  group_by(level) %>%
+  summarise(churn_rate = mean(churn))
+
+churn_by_level
+
+#Step 4b: Plot it
+
+ggplot(churn_by_level, aes(x = level, y = churn_rate)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Churn Rate by Subscription Level",
+    x = "Subscription Level",
+    y = "Churn Rate"
+  ) +
+  theme_minimal()
+
+
+# EDA Results: 
+# Free users churn rate: 23.6%
+# Paid users churn rate: 21.8%
+
+# Initial exploratory analysis shows that free-tier users have a slightly higher churn rate 
+# than paid users. While the difference is modest, it suggests that subscription level 
+# may play a role in churn behavior and should be included as a predictive feature.”
+
+
+# BASELINE MODEL
+
+#step 5a:Filter to song plays only
+
+library(dplyr)
+
+song_df <- df %>%
+  filter(page == "NextSong")
+
+#Step 5b: Total songs played per user
+
+songs_per_user <- song_df %>%
+  group_by(userId) %>%
+  summarise(total_songs = n())
+
+
+#Step 5.3: Total sessions per user
+
+sessions_per_user <- df %>%
+  group_by(userId) %>%
+  summarise(total_sessions = n_distinct(sessionId))
+
+#Step 5.4: Average session length
+
+session_length <- df %>%
+  group_by(userId, sessionId) %>%
+  summarise(
+    session_duration = (max(ts) - min(ts)) / 60000
+  )
+
+avg_session <- session_length %>%
+  group_by(userId) %>%
+  summarise(avg_session_length = mean(session_duration))
+
+#Step 5.5: Subscription level (user-level)
+
+user_level <- df %>%
+  arrange(ts) %>%
+  group_by(userId) %>%
+  summarise(level = last(level))
+
+
+#Step 5.6: Churn label
+
+user_churn <- df %>%
+  select(userId, churn) %>%
+  distinct()
+
+
+
+#Step 5.7: Merge everything into ONE dataset
+
+
+user_features <- user_churn %>%
+  left_join(user_level, by = "userId") %>%
+  left_join(songs_per_user, by = "userId") %>%
+  left_join(sessions_per_user, by = "userId") %>%
+  left_join(avg_session, by = "userId")
+
+head(user_features)
+dim(user_features)
+
+
+
+# Logistic Regression
+
+# Step 6.1: Prepare the data
+
+user_features$level <- as.factor(user_features$level)
+user_features$churn <- as.factor(user_features$churn)
+
+#Step 6.2: Train-test split (80/20)
+
+set.seed(123)
+
+train_index <- sample(1:nrow(user_features), 0.8 * nrow(user_features))
+train_data <- user_features[train_index, ]
+test_data  <- user_features[-train_index, ]
+
+
+#Step 6.3: Fit logistic regression
+model <- glm(
+  churn ~ level + total_songs + total_sessions + avg_session_length,
+  data = train_data,
+  family = "binomial"
+)
+
+summary(model)
+
+
+#Step 6.4: Make predictions
+
+test_data$prob <- predict(model, test_data, type = "response")
+test_data$pred <- ifelse(test_data$prob > 0.5, 1, 0)
+
+#Step 6.5: Confusion matrix
+table(Predicted = test_data$pred, Actual = test_data$churn)
+
+
+#Step 6.6: Accuracy
+
+mean(test_data$pred == as.numeric(as.character(test_data$churn)))
+
+
+# Step 6.7: ROC:AUC
+
+install.packages("pROC")   # once
+library(pROC)
+
+roc_obj <- roc(as.numeric(as.character(test_data$churn)), test_data$prob)
+auc(roc_obj)
+
+
+# Interpretation:
+#Accuracy: 66.7%
+#ROC-AUC: 0.664
+
+#The baseline logistic regression achieved an ROC-AUC of 0.66, 
+#indicating moderate discriminatory power and confirming that user engagement features contain meaningful signal for churn prediction.
+
+#Model Improvement
+
+#STEP 1 Add “Days Since Last Activity”
+
+df$timestamp <- as.POSIXct(df$ts / 1000, origin = "1970-01-01")
+
+#get last activity per user
+library(dplyr)
+
+last_activity <- df %>%
+  group_by(userId) %>%
+  summarise(last_active = max(timestamp))
+
+#Compute inactivity in days
+max_date <- max(df$timestamp)
+
+last_activity <- last_activity %>%
+  mutate(days_inactive = as.numeric(difftime(max_date, last_active, units = "days")))
+
+
+#Merge into user_features
+user_features <- user_features %>%
+  left_join(last_activity[, c("userId", "days_inactive")], by = "userId")
+
+summary(user_features$days_inactive)
+
+
+
+#STEP 2 Retrain Logistic Regression (With Inactivity)
+set.seed(123)
+
+train_index <- sample(1:nrow(user_features), 0.8 * nrow(user_features))
+train_data <- user_features[train_index, ]
+test_data  <- user_features[-train_index, ]
+
+model2 <- glm(
+  churn ~ level + total_songs + total_sessions + 
+    avg_session_length + days_inactive,
+  data = train_data,
+  family = "binomial"
+)
+
+test_data$prob <- predict(model2, test_data, type = "response")
+
+library(pROC)
+roc_obj2 <- roc(as.numeric(as.character(test_data$churn)), test_data$prob)
+auc(roc_obj2)
+
+
+#STEP 3 Random Forest 
+install.packages("randomForest")  # if needed
+library(randomForest)
+
+rf_model <- randomForest(
+  churn ~ level + total_songs + total_sessions +
+    avg_session_length + days_inactive,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_probs <- predict(rf_model, test_data, type = "prob")[,2]
+
+roc_rf <- roc(as.numeric(as.character(test_data$churn)), rf_probs)
+auc(roc_rf)
+
+
+#since the AUC is very large, doing some additional data validations
+
+user_features %>%
+  group_by(churn) %>%
+  summarise(mean_inactive = mean(days_inactive))
+
+colSums(is.na(user_features))
+
+nrow(train_data)
+nrow(test_data)
+
+
+
+summary(model2)
+
+varImpPlot(rf_model)
+
+
+
+auc(roc_obj)      # baseline logistic
+auc(roc_obj2)     # improved logistic
+auc(roc_rf)       # random forest
+
+
